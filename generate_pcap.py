@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 # © 2023 GE Vernova and/or its affiliates. All rights reserved.
 # 2026 improved by Jose Saldana at CIRCE Technology center
+#
+# --- Local patch ---
+# Adds a --samples_per_cycle option so the SV frame rate (sampling_rate =
+# samples_per_cycle * frequency) can be set independently of the number of
+# samples used per mains cycle in the original script (which hard-coded 80).
+# This lets you reach sample rates like 96000 Hz (e.g. 1920 samples/cycle at
+# 50 Hz, or 1600 samples/cycle at 60 Hz) while the simulated waveform still
+# represents a real 50/60 Hz signal, rather than aliasing the waveform
+# frequency itself as the original code would if you just inflated -f.
+#
+# Also adds a --smpcnt_reset option. IEC 61850-9-2's SmpCnt field is an
+# unsigned 16-bit integer (0-65535). The original script resets it once per
+# second (smpCnt = i % sampling_rate), which only fits in 16 bits as long as
+# sampling_rate <= 65536. At 96000 Hz that overflows. "cycle" mode resets
+# SmpCnt once per mains cycle (smpCnt = i % samples_per_cycle) instead, which
+# comfortably fits 16 bits for any realistic samples_per_cycle value. This
+# matches how some high-rate 9-2 implementations behave, but note it is a
+# convention, not something assumed by every SV receiver, so check your
+# receiving IED/tool expects it before relying on it.
 
 import sys
 import struct
@@ -8,19 +27,15 @@ import argparse
 import numpy as np
 
 parser = argparse.ArgumentParser(description="Generate IEC 61850 SV streams")
-
 parser.add_argument(
     "-a", "--app_id", type=int, help="SV stream APPID", default=16384  # 0x4000
 )
-
 parser.add_argument(
     "-s", "--start_id", type=int, help="start index of svID streams", default=0
 )
-
 parser.add_argument(
     "-n", "--nb_streams", type=int, help="Number of SV streams", default=64
 )
-
 parser.add_argument(
     "-m",
     "--nb_asdu",
@@ -30,24 +45,42 @@ parser.add_argument(
     "per loop iteration.",
     default=1,
 )
-
 parser.add_argument("-p", "--svID_prefix", type=str, help="SV ID prefix", default="svID")
-
 parser.add_argument("-d", "--svID_digits", type=int, help="Number of SV ID digits", default=4)
-
 parser.add_argument(
     "-l",
     "--loop",
     type=int,
-    help="Number of iterations."
-    "The smpCnt field will be increased at each loop",
+    help="Number of iterations. The smpCnt field will be increased at each "
+    "loop. No fixed upper limit (other than available memory/disk): the "
+    "whole pcap is built in memory before being written out, at roughly "
+    "(frame_len + 16) bytes per frame per loop iteration.",
     default=4000,
 )
-
 parser.add_argument(
-    "-f", "--frequency", type=float, default=60, help="Loop frequency"
+    "-f", "--frequency", type=float, default=60, help="Nominal mains frequency (Hz) of the simulated waveform"
 )
-
+parser.add_argument(
+    "-c",
+    "--samples_per_cycle",
+    type=int,
+    default=80,
+    help="Number of samples per mains cycle. sampling_rate (the SV frame "
+    "rate) = samples_per_cycle * frequency. Default 80 reproduces the "
+    "original script's behaviour (4000 Hz @50Hz / 4800 Hz @60Hz). Use "
+    "e.g. 1920 with -f 50, or 1600 with -f 60, to reach 96000 Hz.",
+)
+parser.add_argument(
+    "--smpcnt_reset",
+    type=str,
+    choices=["second", "cycle"],
+    default="second",
+    help="When SmpCnt wraps back to 0. 'second' (default, original "
+    "behaviour) wraps once per second at sampling_rate samples; this "
+    "only fits the 16-bit SmpCnt field while sampling_rate <= 65536. "
+    "'cycle' wraps once per mains cycle at samples_per_cycle samples, "
+    "which always fits and is required for sampling rates above 65536.",
+)
 parser.add_argument(
     "-i",
     "--i_rms",
@@ -55,7 +88,6 @@ parser.add_argument(
     default=1,
     help="RMS desired for Current channels",
 )
-
 parser.add_argument(
     "-v",
     "--v_rms",
@@ -63,35 +95,30 @@ parser.add_argument(
     default=57,
     help="RMS desired for Voltage channels",
 )
-
 parser.add_argument(
     "--mac_source",
     type=str,
     help="Source MAC address",
     default="c4:b5:12:00:00:01",
 )
-
 parser.add_argument(
     "--mac_dest",
     type=str,
     help="Destination MAC address",
     default="01:0c:cd:01:00:01",
 )
-
 parser.add_argument(
     "--vlanID",
     type=int,
     help="VLAN ID. 0 to disable VLAN",
     default=0,
 )
-
 parser.add_argument(
     "--vlanPriority",
     type=int,
     help="VLAN Priority",
     default=4,
 )
-
 parser.add_argument(
     "output",
     type=str,
@@ -110,12 +137,14 @@ max_counter = args.loop
 i_rms = args.i_rms
 v_rms = args.v_rms
 nb_digits = args.svID_digits
-svID_max = 10 ** nb_digits - 1
+svID_max = 10**nb_digits - 1
 svID_prefix = args.svID_prefix
 mac_source = args.mac_source
 mac_dest = args.mac_dest
 vlanID = args.vlanID
 vlanPriority = args.vlanPriority
+samples_per_cyle = args.samples_per_cycle
+smpcnt_reset = args.smpcnt_reset
 
 try:
     svID_prefix.encode("ascii")
@@ -149,20 +178,49 @@ if nb_asdu > nb_streams:
     print("Error nb_asdu must be lower than or equal to nb_streams", file=sys.stderr)
     sys.exit(1)
 
-if max_counter < 1 or max_counter > 65536:
-    print("Error loop must be between 1 and 65536", file=sys.stderr)
+if max_counter < 1:
+    print("Error loop must be 1 or greater", file=sys.stderr)
     sys.exit(1)
 
 if freq <= 0:
     print("Error frequency must be greater than 0", file=sys.stderr)
     sys.exit(1)
 
+if samples_per_cyle < 1:
+    print("Error samples_per_cycle must be a positive integer", file=sys.stderr)
+    sys.exit(1)
+
+sampling_rate = samples_per_cyle * freq
+
+# SmpCnt (tag 0x82) is encoded as an unsigned 16-bit integer (INT16U), so its
+# value must stay within 0-65535.
+if smpcnt_reset == "second" and sampling_rate > 65536:
+    print(
+        f"Error: sampling_rate is {sampling_rate:.0f} Hz, which exceeds the "
+        "65536 values representable in SmpCnt's 16-bit field if it is reset "
+        "once per second. Use --smpcnt_reset cycle (resets SmpCnt once per "
+        "mains cycle instead, at samples_per_cycle values, which fits "
+        "comfortably), or reduce samples_per_cycle / frequency.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if smpcnt_reset == "cycle" and samples_per_cyle > 65536:
+    print(
+        "Error samples_per_cycle must be at most 65536 for SmpCnt (16-bit "
+        "field) to represent it when --smpcnt_reset cycle is used",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 if len(mac_source) != 17 or len(mac_dest) != 17:
     print("Error MAC address must be in the format XX:XX:XX:XX:XX:XX", file=sys.stderr)
     sys.exit(1)
 
+
 def mac_string_to_bytes(mac):
     return bytes.fromhex(mac.replace(":", ""))
+
 
 # Check if the MAC address is valid
 try:
@@ -196,7 +254,6 @@ else:
     vlan_header = b""
 
 ETHERTYPE_SV = b"\x88\xBA"
-
 CONF_REV_TLV = b"\x83\x04\x00\x00\x00\x01"
 SMP_SYNC_TLV = b"\x85\x01\x00"
 
@@ -259,8 +316,7 @@ def build_samples(i, sampling_rate):
                 * i_rms
                 * np.sqrt(2)
                 * np.sin(
-                    (2 * np.pi * freq * i / sampling_rate)
-                    + ((2 * np.pi / 3) * index)
+                    (2 * np.pi * freq * i / sampling_rate) + ((2 * np.pi / 3) * index)
                 )
             )
         else:
@@ -274,8 +330,7 @@ def build_samples(i, sampling_rate):
                 * v_rms
                 * np.sqrt(2)
                 * np.cos(
-                    (2 * np.pi * freq * i / sampling_rate)
-                    + ((2 * np.pi / 3) * index)
+                    (2 * np.pi * freq * i / sampling_rate) + ((2 * np.pi / 3) * index)
                 )
             )
         else:
@@ -294,10 +349,9 @@ def build_frame(app_id, asdus):
     return eth_frame
 
 
-samples_per_cyle = 80
-sampling_rate = samples_per_cyle * freq
 scale_factor_amps = 1000
 scale_factor_volts = 100
+
 voltage_channels = ["Va", "Vb", "Vc", "Vn"]
 current_channels = ["Ia", "Ib", "Ic", "In"]
 
@@ -314,7 +368,10 @@ ts = 0
 for i in range(0, max_counter):
     (second, microsecond) = get_second_microsecond(ts)
     ts = (i + 1) / sampling_rate
-    smpCnt = i % int(sampling_rate)
+    if smpcnt_reset == "second":
+        smpCnt = i % int(sampling_rate)
+    else:
+        smpCnt = i % samples_per_cyle
 
     # Samples are identical across all streams/ASDUs at a given sample
     # index, so compute them once per loop iteration.
@@ -325,7 +382,6 @@ for i in range(0, max_counter):
         for st in group:
             svID = f"{svID_prefix}{st:0{nb_digits}d}"
             asdus.append(build_asdu(svID, smpCnt, sample_data))
-
         eth_frame = build_frame(app_id, asdus)
         frame_len = len(eth_frame)
 
@@ -336,7 +392,6 @@ for i in range(0, max_counter):
         record_header = struct.pack(
             "<IIII", second + 1, microsecond + 1, frame_len, frame_len
         )
-
         pcap_data += record_header
         pcap_data += eth_frame
 
